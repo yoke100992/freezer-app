@@ -4,20 +4,101 @@ import { MyLocation as LocationIcon, CloudUpload as CloudUploadIcon, PhotoCamera
 import { storage } from '../utils/storage';
 import { uploadImage } from '../utils/cloudinary';
 
-// 🔥 HELPER BARU: Mengambil Waktu Lokal (Bukan UTC)
+// 1. Helper Waktu Lokal
 const getLocalDateTime = () => {
   const now = new Date();
   const pad = (n) => n.toString().padStart(2, '0');
   return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
 };
 
-const toProperCase = (str) => str.replace(/\w\S*/g, (txt) => txt.charAt(0).toUpperCase() + txt.substr(1).toLowerCase());
-const parseAddressFromDisplayName = (displayName) => {
-  if (!displayName) return { kecamatan: '', kelurahan: '', city: '', provinsi: '' };
-  const parts = displayName.split(',').map(p => p.trim());
-  return { kelurahan: parts[0] || '', kecamatan: parts[1] || '', city: parts[2] || '', provinsi: parts[3] || '' };
+// 2. Helper Proper Case
+const toProperCase = (str) => {
+  if (!str) return '';
+  return str.replace(/\w\S*/g, (txt) => txt.charAt(0).toUpperCase() + txt.substr(1).toLowerCase());
 };
 
+// 3. 🔥 LOCATIONIQ GEOCODING (Gratis, Tanpa Kartu Kredit, Akurat)
+const fetchLocationIQAddress = async (lat, lng) => {
+  const token = import.meta.env.VITE_LOCATIONIQ_TOKEN;
+  if (!token) return null;
+
+  try {
+    const response = await fetch(
+      `https://us1.locationiq.com/v1/reverse?key=${token}&lat=${lat}&lon=${lng}&format=json&addressdetails=1`
+    );
+    const data = await response.json();
+
+    if (data.error || !data.address) return null;
+
+    const addr = data.address;
+
+    // 🔥 PARSING STRUKTUR ALAMAT INDONESIA DARI LOCATIONIQ
+    const provinsi = addr.state || '';
+    const city = addr.city || addr.town || addr.county || addr.municipality || '';
+    
+    // LocationIQ sering menaruh Kecamatan di 'suburb' atau 'town' untuk Indonesia
+    let kecamatan = addr.suburb || addr.town || addr.city_district || '';
+    
+    // Kelurahan sering ada di 'neighbourhood', 'village', atau 'hamlet'
+    let kelurahan = addr.neighbourhood || addr.village || addr.hamlet || addr.quarter || '';
+
+    // Jika kecamatan dan kelurahan tertukar (kadang terjadi di data OSM), kita validasi panjangnya
+    // Biasanya nama Kecamatan lebih pendek/umum, Kelurahan lebih spesifik
+    // Namun, kita biarkan default LocationIQ dulu karena biasanya sudah benar.
+
+    const jalan = addr.road || '';
+    const nomor = addr.house_number || '';
+    const kodePos = addr.postcode || '';
+
+    const detailParts = [jalan, nomor, kelurahan, kecamatan, city, provinsi, kodePos].filter(Boolean);
+
+    return {
+      provinsi: toProperCase(provinsi),
+      city: toProperCase(city),
+      kecamatan: toProperCase(kecamatan),
+      kelurahan: toProperCase(kelurahan),
+      detailAlamat: toProperCase(detailParts.join(', '))
+    };
+  } catch (error) {
+    console.error('LocationIQ error:', error);
+    return null;
+  }
+};
+
+// 4. Fallback Nominatim (Jika LocationIQ gagal/token belum diset)
+const fetchNominatimAddress = async (lat, lng) => {
+  try {
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&accept-language=id&addressdetails=1`,
+      { headers: { 'User-Agent': 'FreezerApp/1.0' } }
+    );
+    const data = await res.json();
+    const addr = data.address || {};
+
+    const provinsi = addr.state || '';
+    const city = addr.city || addr.county || addr.municipality || '';
+    
+    let kecamatan = addr.city_district || addr.town || addr.subdistrict || '';
+    if (!kecamatan && addr.suburb) kecamatan = addr.suburb;
+
+    let kelurahan = addr.neighbourhood || addr.village || addr.hamlet || addr.quarter || '';
+    if (!kelurahan && addr.suburb && addr.suburb !== kecamatan) kelurahan = addr.suburb;
+
+    const detailParts = [addr.road, addr.house_number, kelurahan, kecamatan, city, provinsi, addr.postcode].filter(Boolean);
+
+    return {
+      provinsi: toProperCase(provinsi),
+      city: toProperCase(city),
+      kecamatan: toProperCase(kecamatan),
+      kelurahan: toProperCase(kelurahan),
+      detailAlamat: toProperCase(detailParts.join(', ')) || data.display_name
+    };
+  } catch (error) {
+    return null;
+  }
+};
+
+// 5. Helper Kompresi Gambar
 const compressImage = (file, maxWidth = 1024, maxHeight = 1024, quality = 0.6) => {
   return new Promise((resolve) => {
     const reader = new FileReader();
@@ -43,10 +124,9 @@ export default function InputData({ onRefresh }) {
   const [compressing, setCompressing] = useState(false);
   const [snackbar, setSnackbar] = useState({ open: false, message: '', severity: 'success' });
   
-  // 🔥 PERBAIKAN: Menggunakan getLocalDateTime()
   const [formData, setFormData] = useState({
     tanggal: getLocalDateTime(), 
-    nama: '', area: '', namaToko: '', provinsi: '', city: '', kecamatan: '', kelurahan: '', detailAlamat: '', koordinat: '', merkFreezer: '', noAsset: '', noSeri: '', ukuran: '300L', ukuranOther: '', fotoAsset: null, fotoFreezer: null,
+    nama: null, area: null, namaToko: '', provinsi: '', city: '', kecamatan: '', kelurahan: '', detailAlamat: '', koordinat: '', merkFreezer: '', noAsset: '', noSeri: '', ukuran: '300L', ukuranOther: '', fotoAsset: null, fotoFreezer: null,
   });
   const [previewAsset, setPreviewAsset] = useState('');
   const [previewFreezer, setPreviewFreezer] = useState('');
@@ -54,25 +134,41 @@ export default function InputData({ onRefresh }) {
   const names = storage.getNames();
   const areas = storage.getAreas();
 
-  const handleLocation = () => {
+  const handleLocation = async () => {
     if (!navigator.geolocation) { showSnackbar('Geolocation tidak didukung', 'error'); return; }
-    showSnackbar('Mengambil lokasi...', 'info');
+    showSnackbar('📍 Mengambil lokasi...', 'info');
+    
     navigator.geolocation.getCurrentPosition(async (position) => {
       const { latitude, longitude } = position.coords;
       setFormData(prev => ({ ...prev, koordinat: `${latitude}, ${longitude}` }));
+      
       try {
-        const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&accept-language=id`, { headers: { 'User-Agent': 'FreezerApp/1.0' } });
-        const data = await res.json();
-        const addr = data.address || {};
-        const parsed = parseAddressFromDisplayName(data.display_name);
-        const provinsi = addr.state || addr.province || parsed.provinsi || '';
-        const city = addr.city || addr.county || addr.municipality || parsed.city || '';
-        const kecamatan = parsed.kecamatan || addr.city_district || addr.town || (addr.suburb && addr.suburb !== addr.neighbourhood ? addr.suburb : '') || '';
-        const kelurahan = parsed.kelurahan || addr.neighbourhood || addr.village || addr.hamlet || addr.quarter || '';
-        const detailParts = [addr.road, addr.house_number, kelurahan, kecamatan, city, provinsi, addr.postcode].filter(Boolean);
-        setFormData(prev => ({ ...prev, provinsi: toProperCase(provinsi), city: toProperCase(city), kecamatan: toProperCase(kecamatan), kelurahan: toProperCase(kelurahan), detailAlamat: detailParts.join(', ') || data.display_name || '' }));
-        showSnackbar('Lokasi berhasil diambil!', 'success');
-      } catch (err) { showSnackbar('Gagal mengambil alamat', 'error'); }
+        // 🔥 PRIORITAS 1: LOCATIONIQ (Gratis, Tanpa CC)
+        showSnackbar(' Mencari alamat via LocationIQ...', 'info');
+        let addressData = await fetchLocationIQAddress(latitude, longitude);
+        
+        // 🔥 PRIORITAS 2: NOMINATIM (Fallback Gratis)
+        if (!addressData) {
+          showSnackbar('🗺️ Fallback ke OpenStreetMap...', 'info');
+          addressData = await fetchNominatimAddress(latitude, longitude);
+        }
+
+        if (addressData) {
+          setFormData(prev => ({ 
+            ...prev, 
+            provinsi: addressData.provinsi, 
+            city: addressData.city, 
+            kecamatan: addressData.kecamatan, 
+            kelurahan: addressData.kelurahan, 
+            detailAlamat: addressData.detailAlamat
+          }));
+          showSnackbar('✅ Lokasi berhasil diambil!', 'success');
+        } else {
+          showSnackbar('❌ Gagal mengambil alamat', 'error');
+        }
+      } catch (err) { 
+        showSnackbar('Gagal mengambil alamat', 'error'); 
+      }
     }, (error) => showSnackbar('Izin lokasi ditolak', 'error'));
   };
 
@@ -84,8 +180,7 @@ export default function InputData({ onRefresh }) {
         const compressedFile = await compressImage(file, 1024, 1024, 0.6);
         setFormData(prev => ({ ...prev, [field]: compressedFile }));
         setPreview(URL.createObjectURL(compressedFile));
-        const reduction = ((1 - compressedFile.size / file.size) * 100).toFixed(0);
-        showSnackbar(`🗜️ Foto dikompres (-${reduction}%)`, 'info');
+        showSnackbar(`🗜️ Foto dikompres`, 'info');
       } catch (error) { setFormData(prev => ({ ...prev, [field]: file })); setPreview(URL.createObjectURL(file)); } 
       finally { setCompressing(false); }
     }
@@ -95,23 +190,22 @@ export default function InputData({ onRefresh }) {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!formData.nama || !formData.area || !formData.namaToko || !formData.noAsset || !formData.fotoAsset || !formData.fotoFreezer) { showSnackbar('Harap isi semua field wajib!', 'error'); return; }
+    if (!formData.nama || !formData.area || !formData.namaToko || !formData.noAsset || !formData.fotoAsset || !formData.fotoFreezer) { 
+      showSnackbar('Harap isi semua field wajib!', 'error'); return; 
+    }
     setLoading(true);
     try {
       showSnackbar('Mengupload foto...', 'info');
       const urlAsset = await uploadImage(formData.fotoAsset);
       const urlFreezer = await uploadImage(formData.fotoFreezer);
       if (!urlAsset || !urlFreezer) throw new Error('Gagal upload gambar');
+      
       const finalData = { ...formData, ukuran: formData.ukuran === 'other' ? formData.ukuranOther : formData.ukuran, fotoAsset: urlAsset, fotoFreezer: urlFreezer, id: Date.now().toString() };
       storage.saveAsset(finalData);
       showSnackbar('✅ Data berhasil disimpan!', 'success');
       onRefresh();
       
-      //  PERBAIKAN: Reset waktu juga menggunakan waktu lokal
-      setFormData({ 
-        tanggal: getLocalDateTime(), 
-        nama: '', area: '', namaToko: '', provinsi: '', city: '', kecamatan: '', kelurahan: '', detailAlamat: '', koordinat: '', merkFreezer: '', noAsset: '', noSeri: '', ukuran: '300L', ukuranOther: '', fotoAsset: null, fotoFreezer: null 
-      });
+      setFormData({ tanggal: getLocalDateTime(), nama: null, area: null, namaToko: '', provinsi: '', city: '', kecamatan: '', kelurahan: '', detailAlamat: '', koordinat: '', merkFreezer: '', noAsset: '', noSeri: '', ukuran: '300L', ukuranOther: '', fotoAsset: null, fotoFreezer: null });
       setPreviewAsset(''); setPreviewFreezer('');
     } catch (error) { showSnackbar('❌ ' + (error.message || 'Terjadi kesalahan'), 'error'); } 
     finally { setLoading(false); }
